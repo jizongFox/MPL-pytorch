@@ -7,19 +7,20 @@ import time
 
 import numpy as np
 import torch
-from torch.cuda import amp
 from torch import nn
-from torch.nn import functional as F
 from torch import optim
+from torch.cuda import amp
+from torch.nn import functional as F
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
-import wandb
 from tqdm import tqdm
 
+import wandb
 from data import DATASET_GETTERS
 from models import WideResNet, ModelEMA
+from sampler import InfiniteRandomSampler, InfiniteDistributedSampler
 from utils import (AverageMeter, accuracy, create_loss_fn,
                    save_checkpoint, reduce_tensor, model_load_state_dict)
 
@@ -40,7 +41,7 @@ parser.add_argument('--start-step', default=0, type=int,
 parser.add_argument('--workers', default=4, type=int, help='number of workers')
 parser.add_argument('--num-classes', default=10, type=int, help='number of classes')
 parser.add_argument('--resize', default=32, type=int, help='resize image')
-parser.add_argument('--batch-size', default=64, type=int, help='train batch size')
+parser.add_argument('--batch-size', default=4, type=int, help='train batch size')
 parser.add_argument('--teacher-dropout', default=0, type=float, help='dropout on last dense layer')
 parser.add_argument('--student-dropout', default=0, type=float, help='dropout on last dense layer')
 parser.add_argument('--teacher_lr', default=0.01, type=float, help='train learning late')
@@ -97,7 +98,7 @@ def get_cosine_schedule_with_warmup(optimizer,
             return float(current_step) / float(max(1, num_warmup_steps + num_wait_steps))
 
         progress = float(current_step - num_warmup_steps - num_wait_steps) / \
-            float(max(1, num_training_steps - num_warmup_steps - num_wait_steps))
+                   float(max(1, num_training_steps - num_warmup_steps - num_wait_steps))
         return max(0.0, 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress)))
 
     return LambdaLR(optimizer, lr_lambda, last_epoch)
@@ -143,59 +144,47 @@ def train_loop(args, labeled_loader, unlabeled_loader, test_loader,
         student_model.train()
         end = time.time()
 
-        try:
-            images_l, targets = labeled_iter.next()
-        except:
-            if args.world_size > 1:
-                labeled_epoch += 1
-                labeled_loader.sampler.set_epoch(labeled_epoch)
-            labeled_iter = iter(labeled_loader)
-            images_l, targets = labeled_iter.next()
-
-        try:
-            (images_uw, images_us), _ = unlabeled_iter.next()
-        except:
-            if args.world_size > 1:
-                unlabeled_epoch += 1
-                unlabeled_loader.sampler.set_epoch(unlabeled_epoch)
-            unlabeled_iter = iter(unlabeled_loader)
-            (images_uw, images_us), _ = unlabeled_iter.next()
+        labeled_images, labeled_target = next(labeled_iter)
+        (unlabeled_images_weak, unlabeled_images_strong), _ = next(unlabeled_iter)
 
         data_time.update(time.time() - end)
 
-        images_l = images_l.to(args.device)
-        images_uw = images_uw.to(args.device)
-        images_us = images_us.to(args.device)
-        targets = targets.to(args.device)
+        labeled_images = labeled_images.to(args.device)
+        unlabeled_images_weak = unlabeled_images_weak.to(args.device)
+        unlabeled_images_strong = unlabeled_images_strong.to(args.device)
+        labeled_target = labeled_target.to(args.device)
         with amp.autocast(enabled=args.amp):
-            batch_size = images_l.shape[0]
-            t_images = torch.cat((images_l, images_uw, images_us))
-            t_logits = teacher_model(t_images)
-            t_logits_l = t_logits[:batch_size]
-            t_logits_uw, t_logits_us = t_logits[batch_size:].chunk(2)
-            del t_logits
-
-            t_loss_l = criterion(t_logits_l, targets)
-
-            soft_pseudo_label = torch.softmax(t_logits_uw.detach()/args.temperature, dim=-1)
-            max_probs, hard_pseudo_label = torch.max(soft_pseudo_label, dim=-1)
-            mask = max_probs.ge(args.threshold).float()
-            t_loss_u = torch.mean(
-                -(soft_pseudo_label * torch.log_softmax(t_logits_us, dim=-1)).sum(dim=-1) * mask
+            t_images = torch.cat((labeled_images, unlabeled_images_weak, unlabeled_images_strong))
+            _t_logits = teacher_model(t_images)
+            labeled_logits_teacher, weak_unlabeled_logits_teacher, strong_unlabeled_logits_teacher = torch.split(
+                _t_logits, [x.shape[0] for x in [labeled_images, unlabeled_images_weak, unlabeled_images_strong]]
             )
-            weight_u = args.lambda_u * min(1., (step+1) / args.uda_steps)
-            t_loss_uda = t_loss_l + weight_u * t_loss_u
+            labeled_loss_teacher = criterion(labeled_logits_teacher, labeled_target)
 
-            s_images = torch.cat((images_l, images_us))
-            s_logits = student_model(s_images)
-            s_logits_l = s_logits[:batch_size]
-            s_logits_us = s_logits[batch_size:]
-            del s_logits
+            unlabeled_pseudo_label_simplex = (weak_unlabeled_logits_teacher.detach() / args.temperature).softmax(dim=1)
 
-            s_loss_l_old = F.cross_entropy(s_logits_l.detach(), targets)
-            s_loss = criterion(s_logits_us, hard_pseudo_label)
+            max_probs, unlabeled_pseudo_label_hard = torch.max(unlabeled_pseudo_label_simplex, dim=-1)
+            mask = max_probs.ge(args.threshold).float()
 
-        s_scaler.scale(s_loss).backward()
+            uda_loss_teacher = torch.mean(
+                -(unlabeled_pseudo_label_simplex * torch.log_softmax(strong_unlabeled_logits_teacher, dim=-1)).sum(
+                    dim=-1) * mask
+            )
+
+            weight_u = args.lambda_u * min(1., (step + 1) / args.uda_steps)
+            teacher_conventional_loss = labeled_loss_teacher + weight_u * uda_loss_teacher
+
+            s_images = torch.cat((labeled_images, unlabeled_images_strong), dim=0)
+            _s_logits = student_model(s_images)
+
+            labeled_logits_student, strong_labeled_logits_student = torch.split(
+                _s_logits, [x.shape[0] for x in [labeled_images, unlabeled_images_strong]]
+            )
+
+            student_loss_on_labeled_data_t = F.cross_entropy(labeled_logits_student.detach(), labeled_target.detach())
+            student_loss = criterion(strong_labeled_logits_student, unlabeled_pseudo_label_hard)
+
+        s_scaler.scale(student_loss).backward()
         if args.grad_clip > 0:
             s_scaler.unscale_(s_optimizer)
             nn.utils.clip_grad_norm_(student_model.parameters(), args.grad_clip)
@@ -207,16 +196,18 @@ def train_loop(args, labeled_loader, unlabeled_loader, test_loader,
 
         with amp.autocast(enabled=args.amp):
             with torch.no_grad():
-                s_logits_l = student_model(images_l)
-            s_loss_l_new = F.cross_entropy(s_logits_l.detach(), targets)
+                labeled_logits_student_t_1 = student_model(labeled_images)
+            student_loss_on_labeled_data_t_1 = F.cross_entropy(
+                labeled_logits_student_t_1.detach(), labeled_target.detach()
+            )
             # dot_product = s_loss_l_new - s_loss_l_old
             # test
-            dot_product = s_loss_l_old - s_loss_l_new
+            dot_product = student_loss_on_labeled_data_t - student_loss_on_labeled_data_t_1
             # moving_dot_product = moving_dot_product * 0.99 + dot_product * 0.01
             # dot_product = dot_product - moving_dot_product
-            _, hard_pseudo_label = torch.max(t_logits_us.detach(), dim=-1)
-            t_loss_mpl = dot_product * F.cross_entropy(t_logits_us, hard_pseudo_label)
-            t_loss = t_loss_uda + t_loss_mpl
+            _, unlabeled_pseudo_label_hard = torch.max(strong_unlabeled_logits_teacher.detach(), dim=-1)
+            t_loss_mpl = dot_product * F.cross_entropy(strong_unlabeled_logits_teacher, unlabeled_pseudo_label_hard)
+            t_loss = teacher_conventional_loss + t_loss_mpl
 
         t_scaler.scale(t_loss).backward()
         if args.grad_clip > 0:
@@ -230,23 +221,23 @@ def train_loop(args, labeled_loader, unlabeled_loader, test_loader,
         student_model.zero_grad()
 
         if args.world_size > 1:
-            s_loss = reduce_tensor(s_loss.detach(), args.world_size)
+            student_loss = reduce_tensor(student_loss.detach(), args.world_size)
             t_loss = reduce_tensor(t_loss.detach(), args.world_size)
-            t_loss_l = reduce_tensor(t_loss_l.detach(), args.world_size)
-            t_loss_u = reduce_tensor(t_loss_u.detach(), args.world_size)
+            labeled_loss_teacher = reduce_tensor(labeled_loss_teacher.detach(), args.world_size)
+            uda_loss_teacher = reduce_tensor(uda_loss_teacher.detach(), args.world_size)
             t_loss_mpl = reduce_tensor(t_loss_mpl.detach(), args.world_size)
             mask = reduce_tensor(mask, args.world_size)
 
-        s_losses.update(s_loss.item())
+        s_losses.update(student_loss.item())
         t_losses.update(t_loss.item())
-        t_losses_l.update(t_loss_l.item())
-        t_losses_u.update(t_loss_u.item())
+        t_losses_l.update(labeled_loss_teacher.item())
+        t_losses_u.update(uda_loss_teacher.item())
         t_losses_mpl.update(t_loss_mpl.item())
         mean_mask.update(mask.mean().item())
 
         batch_time.update(time.time() - end)
         pbar.set_description(
-            f"Train Iter: {step+1:3}/{args.total_steps:3}. "
+            f"Train Iter: {step + 1:3}/{args.total_steps:3}. "
             f"LR: {get_lr(s_optimizer):.4f}. Data: {data_time.avg:.2f}s. "
             f"Batch: {batch_time.avg:.2f}s. S_Loss: {s_losses.avg:.4f}. "
             f"T_Loss: {t_losses.avg:.4f}. Mask: {mean_mask.avg:.4f}. ")
@@ -255,8 +246,8 @@ def train_loop(args, labeled_loader, unlabeled_loader, test_loader,
             args.writer.add_scalar("lr", get_lr(s_optimizer), step)
             wandb.log({"lr": get_lr(s_optimizer)})
 
-        args.num_eval = step//args.eval_step
-        if (step+1) % args.eval_step == 0:
+        args.num_eval = step // args.eval_step
+        if (step + 1) % args.eval_step == 0:
             pbar.close()
             if args.local_rank in [-1, 0]:
                 args.writer.add_scalar("train/1.s_loss", s_losses.avg, args.num_eval)
@@ -349,7 +340,7 @@ def evaluate(args, test_loader, model, criterion):
             batch_time.update(time.time() - end)
             end = time.time()
             test_iter.set_description(
-                f"Test Iter: {step+1:3}/{len(test_loader):3}. Data: {data_time.avg:.2f}s. "
+                f"Test Iter: {step + 1:3}/{len(test_loader):3}. Data: {data_time.avg:.2f}s. "
                 f"Batch: {batch_time.avg:.2f}s. Loss: {losses.avg:.4f}. "
                 f"top1: {top1.avg:.2f}. top5: {top5.avg:.2f}. ")
 
@@ -372,12 +363,9 @@ def finetune(args, train_loader, test_loader, model, criterion):
     scaler = amp.GradScaler(enabled=args.amp)
 
     logger.info("***** Running Finetuning *****")
-    logger.info(f"   Finetuning steps = {len(labeled_loader)*args.finetune_epochs}")
+    logger.info(f"   Finetuning steps = {len(labeled_loader) * args.finetune_epochs}")
 
     for epoch in range(args.finetune_epochs):
-        if args.world_size > 1:
-            labeled_loader.sampler.set_epoch(epoch+624)
-
         batch_time = AverageMeter()
         data_time = AverageMeter()
         losses = AverageMeter()
@@ -403,7 +391,7 @@ def finetune(args, train_loader, test_loader, model, criterion):
             losses.update(loss.item(), batch_size)
             batch_time.update(time.time() - end)
             labeled_iter.set_description(
-                f"Finetune Epoch: {epoch+1:2}/{args.finetune_epochs:2}. Data: {data_time.avg:.2f}s. "
+                f"Finetune Epoch: {epoch + 1:2}/{args.finetune_epochs:2}. Data: {data_time.avg:.2f}s. "
                 f"Batch: {batch_time.avg:.2f}s. Loss: {losses.avg:.4f}. ")
         labeled_iter.close()
         if args.local_rank in [-1, 0]:
@@ -482,20 +470,22 @@ def main():
     if args.local_rank == 0:
         torch.distributed.barrier()
 
-    train_sampler = RandomSampler if args.local_rank == -1 else DistributedSampler
+    train_sampler = InfiniteRandomSampler(labeled_dataset, shuffle=True) if args.local_rank == -1 else \
+        InfiniteDistributedSampler(labeled_dataset, shuffle=True)
     labeled_loader = DataLoader(
         labeled_dataset,
-        sampler=train_sampler(labeled_dataset),
+        sampler=train_sampler,
         batch_size=args.batch_size,
         num_workers=args.workers,
-        drop_last=True)
-
+        drop_last=True, persistent_workers=True)
+    train_sampler = InfiniteRandomSampler(unlabeled_dataset, shuffle=True) if args.local_rank == -1 else \
+        InfiniteDistributedSampler(unlabeled_dataset, shuffle=True)
     unlabeled_loader = DataLoader(
         unlabeled_dataset,
-        sampler=train_sampler(unlabeled_dataset),
-        batch_size=args.batch_size*args.mu,
+        sampler=train_sampler,
+        batch_size=args.batch_size * args.mu,
         num_workers=args.workers,
-        drop_last=True)
+        drop_last=True, persistent_workers=True)
 
     test_loader = DataLoader(test_dataset,
                              sampler=SequentialSampler(test_dataset),
@@ -525,7 +515,7 @@ def main():
         torch.distributed.barrier()
 
     logger.info(f"Model: WideResNet {depth}x{widen_factor}")
-    logger.info(f"Params: {sum(p.numel() for p in teacher_model.parameters())/1e6:.2f}M")
+    logger.info(f"Params: {sum(p.numel() for p in teacher_model.parameters()) / 1e6:.2f}M")
 
     teacher_model.to(args.device)
     student_model.to(args.device)
